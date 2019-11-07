@@ -4,7 +4,6 @@ import java.io.Serializable
 
 @transient
 class Task {
-
   private val serialVersionUID = -9205169808581154064L
   @BeanProperty
   var taskid:Long = 0

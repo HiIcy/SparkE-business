@@ -67,6 +67,7 @@ object JDBCHelper {
     datasource = datasource.drop(1)
     head
   }
+
   /**
     * 第五步：开发增删改查的方法
     * 1.执行增删SQL语句的方法
@@ -98,6 +99,7 @@ object JDBCHelper {
     }
     rtn
   }
+
   //执行查询SQL语句
   def executeQuery(sql:String ,params:Seq[Any],
      callback:QueryCallback) {

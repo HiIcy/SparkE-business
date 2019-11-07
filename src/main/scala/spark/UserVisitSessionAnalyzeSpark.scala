@@ -1,22 +1,28 @@
 package spark
-import org.apache.spark.SparkConf
+import java.util.Date
+
+import scala.collection.mutable.{ArrayBuffer, HashMap}
+import org.apache.spark.{Accumulator, SparkConf, SparkContext}
 import org.apache.log4j.{Level, Logger}
 import org.apache.spark.rdd.RDD
-import org.apache.spark.SparkContext
 import org.apache.spark.sql.{DataFrame, Row, SQLContext}
 import org.apache.spark.sql.hive.HiveContext
 import conf.ConfigurationManager
 import constant.Constants
-import impl.DAOFactory
 import test.MockData
-import util.{ParamUtils, StringUtils, ValidUtils}
+import util._
 import com.alibaba.fastjson.JSON
 import com.alibaba.fastjson.JSONArray
 import com.alibaba.fastjson.JSONObject
+import dao.factory.DAOFactory
+import domain.{SessionAggrStat, SessionDetail, SessionRandomExtract}
 import groovy.lang.Tuple
+import jdbc.JDBCHelper
 import org.apache.spark.rdd.RDD
 
 import scala.Tuple2
+import scala.collection.mutable
+import scala.util.Random
 
 object UserVisitSessionAnalyzeSpark {
   Logger.getLogger("org").setLevel(Level.ERROR)
@@ -27,7 +33,9 @@ object UserVisitSessionAnalyzeSpark {
     var conf = new SparkConf()
               .setAppName(Constants.SPARK_APP_NAME)
             .setMaster("local")
-      .set("spark.sql.broadcastTimeout","36000")
+      .set("spark.executor.memory","300M")
+//      .set("spark.eventLog.enabled","true")
+      .set("spark.sql.broadcastTimeout","40000")
     var sc:SparkContext = new SparkContext(conf)
     var sqlContext= getSQLContext(sc)
 
@@ -36,21 +44,21 @@ object UserVisitSessionAnalyzeSpark {
     // 创建需要使用的DAO组件
     val taskDAO =DAOFactory.getTaskDAO
     //那么就首先得查询出来指定的任务，并获取任务的查询参数
-    var taskid = Option[Long](1) // ParamUtils.getTaskIdFromArgs(args)
+    var taskid = Option[Long](2) // ParamUtils.getTaskIdFromArgs(args)
     taskid match {
       case None => System.exit(0)
       case Some(x) => x
     }
 
-    var task = taskDAO.findById(taskid.getOrElse(0))//find的时候就把参数设置了
+    var task = taskDAO.findById(taskid.getOrElse(0))//find的时候就把任务参数设置了
     var taskParam = JSON.parseObject(task.taskParam) //转成一个json对象
+//    println(taskParam)
     //如果要进行session粒度的数据聚合，
     //首先要从user_visit_action表中，查询出来指定日期范围内的数据
-
     var actionRDD = getActionRDDByDateRange(sqlContext,taskParam)
-//    println(actionRDD.getClass)
-//    var res = actionRDD.collect()
-//    res.foreach(println)
+
+    var sessionid2actionRDD = actionRDD.map(row =>(row.getString(2),row))
+
 //    //聚合
 //    //首先，可以将行为数据按照session_id进行groupByKey分组
 //    //此时的数据粒度就是session粒度了，然后可以将session粒度的数据与用户信息数据进行join
@@ -58,12 +66,33 @@ object UserVisitSessionAnalyzeSpark {
 ////    到这里为止，获取的数据是<sessionid,(sessionid,searchKeywords,
 ////    clickCategoryIds,age,professional,city,sex)>
     var sessionid2AggrInfoRDD = aggregateBySession(sqlContext,actionRDD)
-//    sessionid2AggrInfoRDD.collect()
+
     //接着，就要针对session粒度的聚合数据，按照使用者指定的筛选参数进行数据过滤
     //相当于我们自己编写的算子，是要访问外面的任务参数对象的
     //匿名内部类（算子函数），访问外部对象，是要给外部对象使用final 我用的val 修饰的
-    var filteredSessionid2AggrInfoRDD = filterSession(sessionid2AggrInfoRDD,taskParam)
-//    filteredSessionid2AggrInfoRDD.collect()
+
+    //重构，同时进行过滤和统计
+    var sessionAggrStatAccumulator:Accumulator[String] =
+                    sc.accumulator("")(new SessionAggrStatAccumulator())
+    //生成公共RDD：通过筛选条件的session的访问明细数据 :RDD[(String,Row)]
+    var filteredSessionid2AggrInfoRDD = filterSessionAndAggrStat(
+      sessionid2AggrInfoRDD, taskParam, sessionAggrStatAccumulator)
+
+    var sessionid2detailRDD = getSessionid2detailRDD(
+      filteredSessionid2AggrInfoRDD,sessionid2actionRDD
+    )
+
+    //计算出各个范围的session占比，并写入MySQL
+    randomExtractSession(task.getTaskid,filteredSessionid2AggrInfoRDD,sessionid2actionRDD)
+
+    /**
+      * session聚合统计（统计出访问时长和访问步长，各个区间的session数量占总session数量的比例）
+      */
+    calculateAndPersistAggrStat(sessionAggrStatAccumulator.value, task.getTaskid)
+
+    // 获取top10热门品类
+    var top10CategoryList = getTop10Category(task.getTaskid,sessionid2detailRDD)
+
 
     sc.stop()
   }
@@ -135,17 +164,20 @@ object UserVisitSessionAnalyzeSpark {
 //    af.show()
     actionDF.rdd
   }
-  /**
-    * 对行为数据按sesssion粒度进行聚合
-    * @param actionRDD 行为数据RDD
-    * @return session粒度聚合数据
-    */
+
   def mapToPair(tuple:(String, Iterable[Row])):Tuple2[Long, String]={
     var sessionid = tuple._1
     var iterator = tuple._2.iterator
     var searchKeywordsBuffer = new StringBuffer("")
     var clickCategoryIdsBuffer = new StringBuffer("")
     var userid:Long = 0L
+
+    //session的起始、结束时间
+    var startTime:Date = null
+    var endTime:Date = null
+    //session的访问步长
+    var stepLength:Int = 0
+
     while (iterator.hasNext) {
       //提取每个 访问行为的搜索词字段和点击品类字段
       var row = iterator.next()
@@ -173,9 +205,30 @@ object UserVisitSessionAnalyzeSpark {
         clickCategoryId.toString)) {
         clickCategoryIdsBuffer.append(clickCategoryId + ",")
       }
+
+      //计算session 开始 结束时间
+      var actionTime = DateUtils.parseTime(row.getString(4)).orNull
+
+      if(startTime==null){
+        startTime = actionTime
+      }
+      if(endTime == null){
+        endTime = actionTime
+      }
+
+      if(actionTime.before(startTime)) startTime=actionTime
+      if(actionTime.after(endTime)) endTime=actionTime
+
+      // 计算session访问步长
+      stepLength += 1
     }
+
       var searchKeywords = StringUtils.trimComma(searchKeywordsBuffer.toString)
       var clickCategoryIds = StringUtils.trimComma(clickCategoryIdsBuffer.toString)
+
+      //计算session访问时长（秒）
+      var visitLength = (endTime.getTime - startTime.getTime) / 1000
+
       //返回的数据即是<sessionid, partAggrInfo>
       //但是，这一步聚合后，其实还需要将每一行数据，根对应的用户信息进行聚合
       //问题来了，如果是跟用户信息进行聚合的话，那么key就不应该是sessionid，而应该是userid
@@ -193,12 +246,21 @@ object UserVisitSessionAnalyzeSpark {
       //String FIELD_SESSION_ID = "sessionid"
       //String FIELD_SEARCH_KEYWORDS = "searchKeywords"
       //String FIELD_CLICK_CATEGORY_IDS = "clickCategoryIds"
+      //String FIELD_VISIT_LENGTH = "visitLength"
+      //String FIELD_STEP_LENGTH = "stepLength"
       var partAggrInfo = f"${Constants.FIELD_SESSION_ID}=$sessionid|" +
         f"${Constants.FIELD_SEARCH_KEYWORDS}=$searchKeywords|" +
-        f"${Constants.FIELD_CLICK_CATEGORY_IDS}=$clickCategoryIds"
-      var s = new Tuple2[Long,String](userid,partAggrInfo)
-      s
+        f"${Constants.FIELD_CLICK_CATEGORY_IDS}=$clickCategoryIds|" +
+        f"${Constants.FIELD_VISIT_LENGTH}=$visitLength|" +
+        f"${Constants.FIELD_STEP_LENGTH}=$stepLength|" +
+        f"${Constants.FIELD_START_TIME}=${DateUtils.formatTime(startTime)}"
+      new Tuple2[Long,String](userid,partAggrInfo)
   }
+  /**
+    * 对行为数据按session粒度进行聚合
+    * @param actionRDD 行为数据RDD
+    * @return session粒度聚合数据
+    */
   def aggregateBySession(sqlContext:SQLContext,actionRDD:RDD[Row]):RDD[Tuple2[String,String]]={
     //现在actionRDD中的元素是Row，一个Row就是一行用户访问行为记录，比如一次点击或者搜索
     //现在需要将这个Row映射成<sessionid,Row>的格式
@@ -222,14 +284,16 @@ object UserVisitSessionAnalyzeSpark {
   }
   def mapToPair2(tuple:Tuple2[Long,Tuple2[String,Row]]):Tuple2[String,String]={
     var partAggrInfo = tuple._2._1
+//    println(partAggrInfo)
     var userInfoRow = tuple._2._2
     var sessionid = StringUtils.getFieldFromConcatString(
       partAggrInfo,"\\|",Constants.FIELD_SESSION_ID
     ).getOrElse("")
-    var age = userInfoRow.getInt(3)
+    val age = userInfoRow.getInt(3)
     var professional = userInfoRow.getString(4)
     var city = userInfoRow.getString(5)
     var sex = userInfoRow.getString(6)
+
     var fullAggrInfo = partAggrInfo + "|"+ Constants.FIELD_AGE + "=" + age + "|" +
       Constants.FIELD_PROFESSIONAL +
       "=" + professional + "|"+
@@ -238,15 +302,17 @@ object UserVisitSessionAnalyzeSpark {
     Tuple2[String,String](sessionid,fullAggrInfo)
   }
   /**
-    * 过滤session数据
+    * 过滤session数据，并进行聚合统计
     * @param sessionid2AggrInfoRDD
+    * @param taskParam
     * @return
     */
-  // 参数的处理
-  def filterSession(sessionid2AggrInfoRDD:RDD[(String,String)],
-                    taskParam:JSONObject):RDD[(String,String)]={
+  // TODO:参数的处理,
+  def filterSessionAndAggrStat(sessionid2AggrInfoRDD:RDD[(String,String)],
+                    taskParam:JSONObject,sessionAggrStatAccumulator:Accumulator[String]):RDD[(String,String)]={
+//    println(f"过滤之前session还有的值:${sessionid2AggrInfoRDD.count()}")
     //为了使用后面的ValieUtils,所以，首先将所有的筛选参数拼接成一个连接串
-    var startAge = ParamUtils.getParam(taskParam, Constants.PARAM_END_AGE)
+    var startAge = ParamUtils.getParam(taskParam, Constants.PARAM_START_AGE)
     var endAge = ParamUtils.getParam(taskParam, Constants.PARAM_END_AGE)
     var professionals = ParamUtils.getParam(taskParam, Constants.PARAM_PROFESSIONALS)
     var cities = ParamUtils.getParam(taskParam, Constants.PARAM_CITIES)
@@ -258,19 +324,21 @@ object UserVisitSessionAnalyzeSpark {
       f"${getSomeParam(Constants.PARAM_PROFESSIONALS,professionals)}${getSomeParam(Constants.PARAM_CITIES,cities)}" +
       f"${getSomeParam(Constants.PARAM_SEX,sex)}${getSomeParam(Constants.PARAM_KEYWORDS,keywords)}" +
       f"${getSomeParam(Constants.PARAM_CATEGORY_IDS,categoryIds)}"
+
     if(_parameter.endsWith("\\|")){
       _parameter = _parameter.substring(0,_parameter.length-1)
     }
-    var parameter = _parameter
+    val parameter = _parameter
+
     // 根据筛选参数进行过滤
-    var applyd = apply(parameter,_:Tuple2[String,String])
-    // FIXME:new Function?
+    var applyd = apply(sessionAggrStatAccumulator,parameter,_:Tuple2[String,String]) //偏函数 scala写法
+    // FIXME:new Function? 加个序列化idprivate val serialVersionUID: Long = 1L
     var filteredSessionid2AggrInfoRDD = sessionid2AggrInfoRDD.filter(
       x => applyd(x)
     )
     filteredSessionid2AggrInfoRDD
   }
-  def apply(parameter:String,tuple:Tuple2[String,String]): Boolean = {
+  def apply(sessionAggrAccumulator:Accumulator[String],parameter:String,tuple:Tuple2[String,String]): Boolean = {
     var aggrInfo = tuple._2
     //接着，依次按照筛选条件进行过滤
     //按照年龄范围进行过滤（startAge、endAge）
@@ -298,11 +366,491 @@ object UserVisitSessionAnalyzeSpark {
     if(!ValidUtils.in(aggrInfo,Constants.FIELD_CLICK_CATEGORY_IDS,
       parameter,Constants.PARAM_CATEGORY_IDS)) return false
 
+    //如果经过了之前的多个过滤条件之后，程序能够走到这里
+    //那么说明该session是通过了用户指定的筛选条件的，也就是需要保留的session
+    //那么就要对session的访问时长和访问步长进行统计，
+    //根据session对应的范围进行相应的累加计数
+    //只要走到这一步，那么就是需要计数的session
+    sessionAggrAccumulator.add(Constants.SESSION_COUNT)
+
+    //计算出session的访问时长和访问步长的范围，并进行相应的累加
+    var visitLength = StringUtils.getFieldFromConcatString(aggrInfo,
+                "\\|",Constants.FIELD_VISIT_LENGTH).getOrElse("0").toLong
+    var stepLength = StringUtils.getFieldFromConcatString(aggrInfo,
+                "\\|",Constants.FIELD_STEP_LENGTH).getOrElse("0").toLong
+    calculateVisitLength(visitLength)
+    calculatedStepLength(stepLength)
+
+      /**
+      * 计算访问时长范围*/
+    def calculateVisitLength(visitLength:Long):Unit = visitLength match {
+      case _x if _x>=1 && _x <=3 => sessionAggrAccumulator.add(Constants.TIME_PERIOD_1s_3s)
+      case _x if _x>=4 && _x <=6 => sessionAggrAccumulator.add(Constants.TIME_PERIOD_4s_6s)
+      case _x if _x>=7 && _x <=9 => sessionAggrAccumulator.add(Constants.TIME_PERIOD_7s_9s)
+      case _x if _x>=10 && _x <=30 => sessionAggrAccumulator.add(Constants.TIME_PERIOD_10s_30s)
+      case _x if _x>30 && _x <=60 => sessionAggrAccumulator.add(Constants.TIME_PERIOD_30s_60s)
+      case _x if _x>60 && _x <=180 => sessionAggrAccumulator.add(Constants.TIME_PERIOD_1m_3m)
+      case _x if _x>180 && _x <=600 => sessionAggrAccumulator.add(Constants.TIME_PERIOD_3m_10m)
+      case _x if _x>600 && _x <=1800 => sessionAggrAccumulator.add(Constants.TIME_PERIOD_10m_30m)
+      case _x if _x>1800 => sessionAggrAccumulator.add(Constants.TIME_PERIOD_30m)
+      case _ =>
+    }
+    /*计算访问步长*/
+    def calculatedStepLength(stepLength:Long):Unit = stepLength match {
+      case _x if _x >= 1 && _x <= 3 => sessionAggrAccumulator.add(Constants.STEP_PERIOD_1_3)
+      case _x if _x >= 4 && _x <= 6 => sessionAggrAccumulator.add(Constants.STEP_PERIOD_4_6)
+      case _x if _x >= 7 && _x <= 9  => sessionAggrAccumulator.add(Constants.STEP_PERIOD_7_9)
+      case _x if _x >= 10 && _x <= 30 => sessionAggrAccumulator.add(Constants.STEP_PERIOD_10_30)
+      case _x if _x > 30 && _x <= 60 => sessionAggrAccumulator.add(Constants.STEP_PERIOD_30_60)
+      case _x if _x > 60 => sessionAggrAccumulator.add(Constants.STEP_PERIOD_60)
+      case _ =>
+    }
     true
   }
+
   private def getSomeParam(key:String,x:Option[String]): String = x match {
     case Some(y) => f"$key=$y|"
     case None => ""
+  }
+
+  def randomExtract(tuple:Tuple2[String,String]):Tuple2[String,String]={
+    var aggrInfo = tuple._2
+    var startTime = StringUtils.getFieldFromConcatString(aggrInfo,"\\|",
+      Constants.FIELD_START_TIME).getOrElse("")
+    var dateHour = DateUtils.getDateHour(startTime)
+    new Tuple2[String,String](dateHour,aggrInfo)
+  }
+  /**
+    * 随机抽取session
+    */
+  def randomExtractSession(taskid:Long,sessionid2AggrInfoRDD:RDD[(String,String)],
+                           sessionid2actionRDD:RDD[(String,Row)]):Unit= {
+    var time2sessionidRDD = sessionid2AggrInfoRDD.map(
+      // 转成<datehour,aggrInfo>
+      randomExtract
+    )
+
+    // 每个小时各有多少session
+    var countMap = time2sessionidRDD.countByKey() // 根据key来统计 key相同的各有多少
+    //将<yyyy-mm-dd_hh,count>格式的map转换成<yyyy-mm-dd,<hh,count>>的格式，方便后面使用
+    // REW:用可变hash表重构完成！
+    var dateHourCountMap: mutable.HashMap[String, mutable.HashMap[String, Long]] =
+    mutable.HashMap[String, mutable.HashMap[String, Long]]()
+    countMap.foreach { countEntry =>
+      var dateHour = countEntry._1
+      var date = dateHour.split("_")(0)
+      var hour = dateHour.split("_")(1)
+
+      var count = countEntry._2.toLong
+      if (!dateHourCountMap.contains(date)) {
+        var hourCount: mutable.HashMap[String, Long] = mutable.HashMap[String, Long]()
+        dateHourCountMap.put(date, hourCount)
+      }
+      dateHourCountMap(date).put(hour, count)
+    }
+
+      //开始实现按照时间比例随机抽取算法
+      //总共抽取100个session，先按照天数平分 100可以 变量 化
+      var extractNumberPerDay = 100 / dateHourCountMap.size
+      //每一天每一个小时抽取session的索引，<date,<hour,(3,5,20,200)>>
+      var dateHourExtractMap: mutable.HashMap[String, mutable.HashMap[String,
+        mutable.ListBuffer[Int]]] = mutable.HashMap[String, mutable.HashMap[String,
+        mutable.ListBuffer[Int]]]()
+
+      var random = new Random()
+
+      dateHourCountMap.foreach { dateHourCountEntry =>
+        var date = dateHourCountEntry._1
+        var hourCountMap: mutable.HashMap[String, Long] = dateHourCountEntry._2
+        // 计算出这一天的session总数
+        var sessionCount = 0L
+        for (hourCount <- hourCountMap.values) {
+          sessionCount += hourCount
+        }
+
+        var hourExtractMap = dateHourExtractMap.getOrElse(date, null)
+        if (hourExtractMap == null) {
+          hourExtractMap = mutable.HashMap[String, mutable.ListBuffer[Int]]()
+          dateHourExtractMap.put(date, hourExtractMap)
+        }
+        // 该天每个时间的统计
+        hourCountMap.foreach { hourCountEntry =>
+          var hour = hourCountEntry._1
+          var count = hourCountEntry._2
+
+          //计算每个小时的session数量，占据当天总session数量的比例，直接乘以每天要抽取的数量
+          //就可以算出当前小时所需抽取的session数量
+          var hourExtractNumber = ((count.toDouble / sessionCount.toDouble)
+            * extractNumberPerDay).toInt
+          if (hourExtractNumber > count) hourExtractNumber = count.toInt
+
+          //先获取当前小时的存放随机数list
+          var extractIndexList: mutable.ListBuffer[Int] = hourExtractMap.getOrElse(hour, null)
+          if (extractIndexList == null) {
+            extractIndexList = mutable.ListBuffer[Int]()
+            hourExtractMap.put(hour, extractIndexList)
+          }
+          //生成上面计算出来的数量的随机数
+          for (i <- 0 until hourExtractNumber) {
+            var extractIndex = random.nextInt(count.toInt)
+            // 不重复
+            while (extractIndexList.contains(extractIndex)) {
+              extractIndex = random.nextInt(count.toInt)
+            }
+            extractIndexList.append(extractIndex)
+          }
+        }
+      }
+
+    /**
+      * 第三步：遍历每天每小时的session，根据随机索引抽取
+      */
+    //执行groupByKey算子，得到<dateHour,(session aggrInfo)>
+    var time2sessionsRDD = time2sessionidRDD.groupByKey()
+//    println(f"还剩: ${time2sessionsRDD.count()}")
+    //我们用flatMap算子遍历所有的<dateHour,("session aggrInfo")>格式的数据
+    //然后会遍历每天每小时的session
+    //如果发现某个session恰巧在我们指定的这天这小时的随机抽取索引上
+    //那么抽取该session，直接写入MySQL的random_extract_session表
+    //将抽取出来的session id返回回来，形成一个新的JavaRDD<String>
+    //然后最后一步，用抽取出来的sessionid去join它们的访问行为明细数据写入session表
+
+    var randtime2sessions = randomTime(taskid,dateHourExtractMap,_:Tuple2[String,Iterable[String]])
+    // FIXME:匿名函数的task serialable 没有弄好
+    // (FAQ:貌似匿名函数里有其他类就要报错
+    println(f"time2sessionsRDD:${time2sessionsRDD.count()}")
+    var extractSessionidsRDD = time2sessionsRDD.flatMap {
+      randtime2sessions
+    }
+    println(f"apply")
+
+    /**
+    * 第四步：获取抽取出来的session的明细数据
+    */
+    var extractSessionDetailRDD = extractSessionidsRDD.join(sessionid2actionRDD)
+    var call = write2Mysql(taskid,_:Tuple2[String,Tuple2[String,Row]])
+    println(f"extractsesfisng:${extractSessionDetailRDD.count()}")
+    extractSessionDetailRDD.foreach(call) // FAQ:写到mysql 要挂起？
+    }
+
+  def randomTime(taskid:Long,dateHourExtractMap:mutable.HashMap[String, mutable.HashMap[String,
+                    mutable.ListBuffer[Int]]],tuple:Tuple2[String,Iterable[String]]):Iterable[Tuple2[String,String]]={
+        var extractSessionids = new mutable.ArrayBuffer[Tuple2[String,String]]()
+        var dateHour = tuple._1
+        var date = dateHour.split("_")(0)
+        var hour = dateHour.split("_")(1)
+        var iterator = tuple._2.iterator
+
+        //拿到这一天这一小时的随机索引
+        var extractIndexList = dateHourExtractMap(date)(hour)
+        var sessionRandomExtractDAO = DAOFactory.getSessionRandomExtractDAO
+
+        var index=0
+        while (iterator.hasNext){
+          var sessionAggrInfo = iterator.next()
+          if(extractIndexList.contains(index)){
+            var sessionid= StringUtils.getFieldFromConcatString(sessionAggrInfo,
+              "\\|",Constants.FIELD_SESSION_ID).getOrElse("")
+            //写入mysql
+            var sessionRandomExtract = new SessionRandomExtract()
+            sessionRandomExtract.setTaskid(taskid)
+            sessionRandomExtract.setSessionid(sessionid)
+            sessionRandomExtract.setStartTime(StringUtils.getFieldFromConcatString(
+              sessionAggrInfo,"\\|",Constants.FIELD_START_TIME
+            ).getOrElse(""))
+            sessionRandomExtract.setSearchKeywords(StringUtils.getFieldFromConcatString(
+              sessionAggrInfo,"\\|",Constants.FIELD_SEARCH_KEYWORDS
+            ).getOrElse(""))
+            sessionRandomExtract.setClickCategoryIds(StringUtils.getFieldFromConcatString(
+              sessionAggrInfo,"\\|",Constants.FIELD_CLICK_CATEGORY_IDS
+            ).getOrElse(""))
+            //插入mysql
+//            sessionRandomExtractDAO.insert(sessionRandomExtract)
+            extractSessionids.append(new Tuple2[String,String](sessionid,sessionid))
+//            println("inset")
+          }
+          index += 1
+        }
+         extractSessionids.toSeq
+      }
+
+  def write2Mysql(taskid:Long,tuple:Tuple2[String,Tuple2[String,Row]]):Unit={
+    var row = tuple._2._2
+    var sessionDetail = new SessionDetail()
+    sessionDetail.setTaskid(taskid)
+    sessionDetail.setUserid(row.getLong(1))
+    sessionDetail.setSessionid(row.getString(2))
+    sessionDetail.setPageid(row.getLong(3))
+    sessionDetail.setActionTime(row.getString(4))
+    sessionDetail.setSearchKeyword(row.getString(5))
+    sessionDetail.setClickCategoryId(row.getLong(6))
+    sessionDetail.setClickProductId(row.getLong(7))
+    sessionDetail.setOrderCategoryIds(row.getString(8))
+    sessionDetail.setOrderProductIds(row.getString(9))
+    sessionDetail.setPayCategoryIds(row.getString(10))
+    sessionDetail.setPayProductIds(row.getString(11))
+    // FIXME:我觉得这里可以把DAO抽离出来
+    var sessionDetailDAO = DAOFactory.getSessionDetailDAO
+    // FIXME: 改成batch形式 试下
+//    sessionDetailDAO.insert(sessionDetail)
+    println("insert ")
+  }
+
+  /*计算各session的访问时长和访问步长所占比例
+     * 计算各session范围占比，并写入MySQL
+     */
+  def calculateAndPersistAggrStat(value:String,taskid:Long): Unit ={
+//    println(f"none $value")
+    // 从Accumulator统计串中获取值
+    var session_count = StringUtils.getFieldFromConcatString(
+      value,"\\|",Constants.SESSION_COUNT).getOrElse("0").toDouble
+    var visit_length_1s_3s = StringUtils.getFieldFromConcatString(
+      value, "\\|", Constants.TIME_PERIOD_1s_3s).getOrElse("0").toDouble
+    var visit_length_4s_6s = StringUtils.getFieldFromConcatString(
+      value, "\\|", Constants.TIME_PERIOD_4s_6s).getOrElse("0").toDouble
+    var visit_length_7s_9s = StringUtils.getFieldFromConcatString(
+      value, "\\|", Constants.TIME_PERIOD_7s_9s).getOrElse("0").toDouble
+    var visit_length_10s_30s = StringUtils.getFieldFromConcatString(
+      value, "\\|", Constants.TIME_PERIOD_10s_30s).getOrElse("0").toDouble
+    var visit_length_30s_60s = StringUtils.getFieldFromConcatString(
+      value, "\\|", Constants.TIME_PERIOD_30s_60s).getOrElse("0").toDouble
+    var visit_length_1m_3m = StringUtils.getFieldFromConcatString(
+      value, "\\|", Constants.TIME_PERIOD_1m_3m).getOrElse("0").toDouble
+    var visit_length_3m_10m = StringUtils.getFieldFromConcatString(
+      value, "\\|", Constants.TIME_PERIOD_3m_10m).getOrElse("0").toDouble
+    var visit_length_10m_30m = StringUtils.getFieldFromConcatString(
+      value, "\\|", Constants.TIME_PERIOD_10m_30m).getOrElse("0").toDouble
+    var visit_length_30m = StringUtils.getFieldFromConcatString(
+      value, "\\|", Constants.TIME_PERIOD_30m).getOrElse("0").toDouble
+
+    var step_length_1_3 = StringUtils.getFieldFromConcatString(
+      value, "\\|", Constants.STEP_PERIOD_1_3).getOrElse("0").toDouble
+    var step_length_4_6 = StringUtils.getFieldFromConcatString(
+      value, "\\|", Constants.STEP_PERIOD_4_6).getOrElse("0").toDouble
+    var step_length_7_9 = StringUtils.getFieldFromConcatString(
+      value, "\\|", Constants.STEP_PERIOD_7_9).getOrElse("0").toDouble
+    var step_length_10_30 = StringUtils.getFieldFromConcatString(
+      value, "\\|", Constants.STEP_PERIOD_10_30).getOrElse("0").toDouble
+    var step_length_30_60 = StringUtils.getFieldFromConcatString(
+      value, "\\|", Constants.STEP_PERIOD_30_60).getOrElse("0").toDouble
+    var step_length_60 = StringUtils.getFieldFromConcatString(
+      value, "\\|", Constants.STEP_PERIOD_60).getOrElse("0").toDouble
+
+    var visit_length_1s_3s_ratio :Double = 0.0
+    var visit_length_4s_6s_ratio :Double = 0.0
+    var visit_length_7s_9s_ratio :Double = 0.0
+    var visit_length_10s_30s_ratio :Double = 0.0
+    var visit_length_30s_60s_ratio :Double = 0.0
+    var visit_length_1m_3m_ratio :Double = 0.0
+    var visit_length_3m_10m_ratio :Double = 0.0
+    var visit_length_10m_30m_ratio :Double = 0.0
+    var visit_length_30m_ratio :Double = 0.0
+
+    var step_length_1_3_ratio :Double = 0.0
+    var step_length_4_6_ratio :Double = 0.0
+    var step_length_7_9_ratio :Double = 0.0
+    var step_length_10_30_ratio :Double = 0.0
+    var step_length_30_60_ratio :Double = 0.0
+    var step_length_60_ratio:Double = 0.0
+    println(session_count)
+    session_count match {
+      //计算各个访问时长和访问步长的范围
+      case x if x.toInt > 0 =>
+        println("---")
+        //计算各个访问时长和访问步长的范围
+        visit_length_1s_3s_ratio = NumberUtils.formatDouble(
+          visit_length_1s_3s / session_count, 2)
+        visit_length_4s_6s_ratio = NumberUtils.formatDouble(
+          visit_length_4s_6s / session_count, 2)
+        visit_length_7s_9s_ratio = NumberUtils.formatDouble(
+          visit_length_7s_9s / session_count, 2)
+        visit_length_10s_30s_ratio = NumberUtils.formatDouble(
+          visit_length_10s_30s / session_count, 2)
+        visit_length_30s_60s_ratio = NumberUtils.formatDouble(
+          visit_length_30s_60s / session_count, 2)
+        visit_length_1m_3m_ratio = NumberUtils.formatDouble(
+          visit_length_1m_3m / session_count, 2)
+        visit_length_3m_10m_ratio = NumberUtils.formatDouble(
+          visit_length_3m_10m / session_count, 2)
+        visit_length_10m_30m_ratio = NumberUtils.formatDouble(
+          visit_length_10m_30m / session_count, 2)
+        visit_length_30m_ratio = NumberUtils.formatDouble(
+          visit_length_30m / session_count, 2)
+
+        step_length_1_3_ratio = NumberUtils.formatDouble(
+          step_length_1_3 / session_count, 2)
+        step_length_4_6_ratio = NumberUtils.formatDouble(
+          step_length_4_6 / session_count, 2)
+        step_length_7_9_ratio = NumberUtils.formatDouble(
+          step_length_7_9 / session_count, 2)
+        step_length_10_30_ratio = NumberUtils.formatDouble(
+          step_length_10_30 / session_count, 2)
+        step_length_30_60_ratio = NumberUtils.formatDouble(
+          step_length_30_60 / session_count, 2)
+        step_length_60_ratio = NumberUtils.formatDouble(
+          step_length_60 / session_count, 2)
+
+      case _ =>
+    }
+
+
+    var sessionAggrStat = new SessionAggrStat()
+    sessionAggrStat.setTaskid(taskid)
+    sessionAggrStat.setSession_count(session_count.toInt)
+    sessionAggrStat.setVisit_length_1s_3s_ratio(visit_length_1s_3s_ratio)
+    sessionAggrStat.setVisit_length_4s_6s_ratio(visit_length_4s_6s_ratio)
+    sessionAggrStat.setVisit_length_7s_9s_ratio(visit_length_7s_9s_ratio)
+    sessionAggrStat.setVisit_length_10s_30s_ratio(visit_length_10s_30s_ratio)
+    sessionAggrStat.setVisit_length_30s_60s_ratio(visit_length_30s_60s_ratio)
+    sessionAggrStat.setVisit_length_1m_3m_ratio(visit_length_1m_3m_ratio)
+    sessionAggrStat.setVisit_length_3m_10m_ratio(visit_length_3m_10m_ratio)
+    sessionAggrStat.setVisit_length_10m_30m_ratio(visit_length_10m_30m_ratio)
+    sessionAggrStat.setVisit_length_30m_ratio(visit_length_30m_ratio)
+
+    sessionAggrStat.setStep_length_1_3_ratio(step_length_1_3_ratio)
+    sessionAggrStat.setStep_length_4_6_ratio(step_length_4_6_ratio)
+    sessionAggrStat.setStep_length_7_9_ratio(step_length_7_9_ratio)
+    sessionAggrStat.setStep_length_10_30_ratio(step_length_10_30_ratio)
+    sessionAggrStat.setStep_length_30_60_ratio(step_length_30_60_ratio)
+    sessionAggrStat.setStep_length_60_ratio(step_length_60_ratio)
+
+    var sessionAggrStatDAO = DAOFactory.getSessionAggrStatDAO
+    sessionAggrStatDAO.insert(sessionAggrStat)
+  }
+  /**
+    * 获取通过筛选条件的session的访问明细数据RDD
+    * @param sessionid2aggrInfoRDD
+    * @param sessionid2actionRDD
+    * @return
+    */
+  def getSessionid2detailRDD(sessionid2aggrInfoRDD: RDD[(String, String)], sessionid2actionRDD: RDD[(String, Row)]):
+              RDD[Tuple2[String,Row]]={
+    var sessionid2detailRDD = sessionid2aggrInfoRDD.join(sessionid2actionRDD).map{row=>
+        new Tuple2[String,Row](row._1,row._2._2)
+    }
+    sessionid2detailRDD
+  }
+  /**
+    * 获取Top10热门品类
+    * @param filteredSessionid2AggrInfoRDD
+    * @param sessionid2actionRDD
+    */
+  def getTop10Category(taskid:Long,
+                       sessionid2detailRDD:RDD[(String,Row)]):Unit={
+    /**
+      * 第一步：获取符合条件的session访问过的所有品类
+      * 已经获取了
+      */
+
+    //获取session访问过的所有品类id
+    //访问过指的是点击、下单、支付的品类
+    var categoryidRDD = sessionid2detailRDD.flatMap{ tuple =>
+      var row = tuple._2
+      var list = new mutable.ArrayBuffer[(Long,Long)]()
+      var clickCategoryId = row.getLong(6)
+      if(clickCategoryId!=null) list.append(new Tuple2[Long,Long](clickCategoryId,clickCategoryId))
+      var orderCategoryIds = row.getString(8)
+      if(orderCategoryIds!=null){
+        var orderCategoryIdsSplited = orderCategoryIds.split(",")
+        for (orderCategoryId <- orderCategoryIdsSplited){
+          list.append(new Tuple2[Long,Long](orderCategoryId.toLong,orderCategoryId.toLong))
+        }
+      }
+
+      var payCategoryIds = row.getString(10)
+      if (payCategoryIds != null) {
+        val payCategoryIdsSplited = payCategoryIds.split(",")
+        for (payCategoryId <- payCategoryIdsSplited) {
+          list.append(new Tuple2[Long, Long](payCategoryId.toLong,payCategoryId.toLong))
+        }
+      }
+      list
+    }
+
+    //必须去重
+    //如果不去重的话，会出现重复的categoryid，排序会对重复的categoryid以及countInfo进行排序
+    //最后很可能会拿到重复的数据 这里应该是筛选出操作过的categoryid 后面再对操作计数
+    categoryidRDD = categoryidRDD.distinct()
+
+    /**
+      * 第二步：计算各品类的点击、下单和支付的次数
+      */
+    //访问明细中，其中三种访问行为是点击、下单和支付
+    //分别来计算各品类点击、下单和支付的次数，可以先对访问明细数据进行过滤
+    //分别过滤点击、下单和支付行为，然后通过map、reduceByKey等算子进行计算
+
+    //计算各个品类点击次数
+    def getClickCategoryId2CountRDD(sessionid2detailRDD: RDD[(String, Row)]):RDD[(Long,Long)]={
+      var clickActionRDD = sessionid2detailRDD.filter { tuple =>
+        var row = tuple._2
+        var flag = false
+        if (row.get(6)!=null) flag=true
+        flag
+      }
+      var clickCategoryIdRDD = clickActionRDD.map { tuple =>
+        var clickCategoryId = tuple._2.getLong(6)
+        new Tuple2[Long,Long](clickCategoryId,1L)
+      }
+
+      var clickCategoryId2CountRDD = clickCategoryIdRDD.reduceByKey{ (v1,v2) =>
+        v1+v2
+      }
+      clickCategoryId2CountRDD
+    }
+    var clickCategoryId2CountRDD = //categoryid:点击量
+      getClickCategoryId2CountRDD(sessionid2detailRDD)
+
+    //计算各个品类的下单次数
+    def getOrderCategoryId2CountRDD(sessionid2detailRDD: RDD[(String, Row)]):RDD[(Long,Long)]={
+      var orderActionRDD = sessionid2detailRDD.filter { tuple =>
+        var row = tuple._2
+        var flag = false
+        if (row.get(8)!=null) flag=true
+        flag
+      }
+      var orderCategoryIdRDD = orderActionRDD.flatMap{ tuple =>  // 这个用法很好
+        var orderCategoryIds = tuple._2.getString(8)
+        var orderCategoryIdsSplited = orderCategoryIds.split(",")
+        var list = new ArrayBuffer[(Long,Long)]()
+        for (orderCategoryId <- orderCategoryIdsSplited ) {
+          list.append(new Tuple2[Long,Long](orderCategoryId.toLong,1L))
+        }
+        list
+      }
+
+      var orderCategoryId2CountRDD = orderCategoryIdRDD.reduceByKey{ (v1,v2) =>
+        v1+v2
+      }
+      orderCategoryId2CountRDD
+    }
+
+    val orderCategoryId2CountRDD = getOrderCategoryId2CountRDD(sessionid2detailRDD)
+
+    //计算各个品类的支付次数
+    def getPayCategoryId2CountRDD(sessionid2detailRDD: RDD[(String, Row)]):RDD[(Long,Long)]={
+      var payActionRDD = sessionid2detailRDD.filter { tuple =>
+        var row = tuple._2
+        var flag = false
+        if (row.get(8)!=null) flag=true
+        flag
+      }
+      var payCategoryIdRDD = payActionRDD.flatMap{ tuple =>  // 这个用法很好
+        var payCategoryIds = tuple._2.getString(8)
+        var payCategoryIdsSplited = payCategoryIds.split(",")
+        var list = new ArrayBuffer[(Long,Long)]()
+        for (payCategoryId <- payCategoryIdsSplited ) {
+          list.append(new Tuple2[Long,Long](payCategoryId.toLong,1L))
+        }
+        list
+      }
+
+      var payCategoryId2CountRDD = payCategoryIdRDD.reduceByKey{ (v1,v2) =>
+        v1+v2
+      }
+      payCategoryId2CountRDD
+    }
+    val payCategoryId2CountRDD = getPayCategoryId2CountRDD(sessionid2detailRDD)
+
   }
 }
 

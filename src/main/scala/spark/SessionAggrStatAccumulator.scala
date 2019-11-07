@@ -41,28 +41,21 @@ class SessionAggrStatAccumulator extends AccumulatorParam[String] {
   //这两个方法，主要实现，v1可能就是我们初始化的那个连接串
   //v2就是在遍历session的时候，判断出某个session对应的区间，然后用Constants.TIME_PERIOD_1S_3S
   //所以，我们要做的事情就是在v1中，找到对应的v2对应的value，累加1，然后再更新到连接串里面去
-  override def addInPlace(r1: String, r2: String): String = null
-
-  /**
-    * session统计计算逻辑
-    *
-    * @param v1连接串
-    * @param v2 范围区间
-    * @return更新以后的连接串
-    */
-  private def add(v1:String,v2:String):String={
+  override def addInPlace(r1: String, r2: String): String = {
     //校验，v1为空的时候 直接返回v2
-    if(StringUtils.isEmpty(v1)){
-      return v2
+    if(StringUtils.isEmpty(r1)){
+      return r2
     }
     //使用StringUtils工具类，从v1中提取v2对应的值，并累加1
-    var oldValue = StringUtils.getFieldFromConcatString(v1,"\\|",v2)
+    var oldValue = StringUtils.getFieldFromConcatString(r1,"\\|",r2)
     var newValue = oldValue match {
       case Some(x) => Integer.valueOf(x) + 1
-      case None => return v1
+      case None => return r1
     }
-    StringUtils.setFieldFromConcatString(v1,"\\|",v2,
+    var res = StringUtils.setFieldFromConcatString(r1,"\\|",r2,
       newValue.toString)
+    res
   }
+
 }
 }

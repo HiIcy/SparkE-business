@@ -83,4 +83,18 @@ object DateUtils {
     * @return 格式化后的时间
     */
   def formatTime(date:Date):String = TIME_FORMAT.format(date)
+
+    /**
+    * 解析时间字符串
+    * @param time 时间字符串
+    * @return
+    */
+  def parseTime(time:String):Option[Date]={
+    try{
+      return Some(TIME_FORMAT.parse(time))
+    }catch {
+      case e:Throwable=>e.printStackTrace()
+    }
+    None
+  }
 }

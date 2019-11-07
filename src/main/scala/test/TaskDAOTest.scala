@@ -1,6 +1,6 @@
 package test
 
-import impl.DAOFactory
+import dao.factory.DAOFactory
 
 /**
   * 任务管理DAO测试类

@@ -36,10 +36,12 @@ object StringUtils {
   def getFieldFromConcatString(str:String,delimiter:String,field:String):Option[String]={
     var fields = str.split(delimiter)
     for(concatField <- fields){
-      var fieldName = concatField.split("=")(0)
-      var fieldValue = concatField.split("=")(1)
-      if(fieldName.equals(field)){
-        Some(fieldValue)
+      if(concatField.split("=").length==2) {
+        var fieldName = concatField.split("=")(0)
+        var fieldValue = concatField.split("=")(1)
+        if (fieldName.equals(field)) {
+          return Some(fieldValue)
+        }
       }
     }
     None
