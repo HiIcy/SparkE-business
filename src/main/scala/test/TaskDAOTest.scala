@@ -4,9 +4,6 @@ import dao.factory.DAOFactory
 
 /**
   * 任务管理DAO测试类
- *
-  * @author Erik
-  *
   */
 object TaskDAOTest {
   def main(args: Array[String]): Unit = {

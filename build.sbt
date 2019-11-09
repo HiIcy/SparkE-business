@@ -15,6 +15,8 @@ libraryDependencies += "org.apache.spark" %% "spark-streaming" % "1.5.1" % "prov
 libraryDependencies += "org.apache.spark" %% "spark-hive" % "1.5.1"
 libraryDependencies += "org.apache.spark" %% "spark-graphx" % "1.5.1"
 libraryDependencies += "org.projectlombok" % "lombok" % "1.18.10"
+libraryDependencies += "it.unimi.dsi" % "fastutil" % "8.3.0"
+
 
 
 

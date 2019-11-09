@@ -5,21 +5,21 @@ import scala.beans.BeanProperty
 @transient
 class SessionDetail {
   @BeanProperty
-  var taskid = 0L
+  var taskid:Long = _
   @BeanProperty
-  var userid = 0L
+  var userid:Long = _
   @BeanProperty
   var sessionid: String = _
   @BeanProperty
-  var pageid = 0L
+  var pageid:Long = _
   @BeanProperty
   var actionTime:String = _
   @BeanProperty
   var searchKeyword:String =_
   @BeanProperty
-  var clickCategoryId = 0L
+  var clickCategoryId:Long = _
   @BeanProperty
-  var clickProductId = 0L
+  var clickProductId:Long = _
   @BeanProperty
   var orderCategoryIds:String =_
   @BeanProperty

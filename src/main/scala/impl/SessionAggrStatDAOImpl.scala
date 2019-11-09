@@ -4,7 +4,6 @@ import dao.ISessionAggrStatDAO
 import domain.SessionAggrStat
 /**
   * session聚合统计实现类
-  * @author Erik
   *
   */
 class SessionAggrStatDAOImpl extends ISessionAggrStatDAO {

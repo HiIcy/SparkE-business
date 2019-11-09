@@ -1,15 +1,20 @@
 package constant
 
 object Constants {
+  /**
+    * 项目配置相关的常量
+    */
   val JDBC_DRIVER = "jdbc.driver"
   val JDBC_DATASOURCE_SIZE="jdbc.datasource.size"
   val JDBC_URL="jdbc.url"
   val JDBC_USER="jdbc.user"
   val JDBC_PASSWORD="jdbc.password"
   val SPARK_LOCAL = "spark.local"
+
+  /**
+    * spark作业相关的常量
+    */
   val SPARK_APP_NAME = "UserVisitSessionAnalyzeSpark"
-  val PARAM_START_DATE = "startDate"
-  val PARAM_END_DATE = "endDate"
   val FIELD_SESSION_ID = "sessionid"
   val FIELD_SEARCH_KEYWORDS = "searchKeywords"
   val FIELD_CLICK_CATEGORY_IDS = "clickCategoryIds"
@@ -17,13 +22,15 @@ object Constants {
   val FIELD_PROFESSIONAL = "professional"
   val FIELD_CITY = "city"
   val FIELD_SEX = "sex"
-  val PARAM_START_AGE = "startAge"
-  val PARAM_END_AGE = "endAge"
-  val PARAM_PROFESSIONALS = "professionals"
-  val PARAM_CITIES = "cities"
-  val PARAM_SEX = "sex"
-  val PARAM_KEYWORDS = "keywords"
-  val PARAM_CATEGORY_IDS = "categoryIds"
+  val FIELD_VISIT_LENGTH = "visitLength"
+  val FIELD_STEP_LENGTH = "stepLength"
+  val FIELD_START_TIME = "starttime"
+
+  val FIELD_CATEGORY_ID = "categoryid"
+  val FIELD_CLICK_COUNT = "clickCount"
+  val FIELD_ORDER_COUNT = "orderCount"
+  val FIELD_PAY_COUNT = "payCount"
+
   val SESSION_COUNT = "session_count"
   val TIME_PERIOD_1s_3s = "1s_3s"
   val TIME_PERIOD_4s_6s = "4s_6s"
@@ -40,7 +47,14 @@ object Constants {
   val STEP_PERIOD_10_30 = "10_30"
   val STEP_PERIOD_30_60 = "30_60" 
   val STEP_PERIOD_60 = "60"
-  val FIELD_VISIT_LENGTH = "visitLength"
-  val FIELD_STEP_LENGTH = "stepLength"
-  val FIELD_START_TIME = "starttime"
+
+  val PARAM_START_AGE = "startAge"
+  val PARAM_END_AGE = "endAge"
+  val PARAM_PROFESSIONALS = "professionals"
+  val PARAM_CITIES = "cities"
+  val PARAM_SEX = "sex"
+  val PARAM_KEYWORDS = "keywords"
+  val PARAM_CATEGORY_IDS = "categoryIds"
+  val PARAM_START_DATE = "startDate"
+  val PARAM_END_DATE = "endDate"
 }

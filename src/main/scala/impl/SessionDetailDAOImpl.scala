@@ -5,7 +5,7 @@ import jdbc.JDBCHelper
 
 
 class SessionDetailDAOImpl extends ISessionDetailDAO {
-  def insert(sessionDetail: SessionDetail): Unit = {
+  override def insert(sessionDetail: SessionDetail): Unit = {
     val sql = "insert into session_detail value(?,?,?,?,?,?,?,?,?,?,?,?)"
     val params = Array[Any](sessionDetail.getTaskid,
                           sessionDetail.getUserid,

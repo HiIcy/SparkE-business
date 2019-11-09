@@ -6,7 +6,6 @@ import jdbc.JDBCHelper
 
 /**
   * 任务管理DAO实现类
-  * @author Erik
   *
   */
 

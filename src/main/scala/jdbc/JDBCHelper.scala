@@ -84,6 +84,7 @@ object JDBCHelper {
   def executeUpdate(sql:String,params:Seq[Any]):Int={
     var rtn = 0
     var conn = getConnection
+
     try{
       var pstmt = conn.prepareStatement(sql)
       for(i <- params.indices){
@@ -94,7 +95,7 @@ object JDBCHelper {
       case e:Exception => e.printStackTrace()
     }finally {
       if(conn!=null){
-        datasource.:+(conn)
+        datasource=datasource.:+(conn)
       }
     }
     rtn

@@ -10,7 +10,6 @@ import util.StringUtils
   * 根据不同的值，去做复杂的逻辑
   *
   * Spark Core使用的高端技术
-  * @author Erik
   *
   */
 package spark{
